@@ -1,0 +1,125 @@
+name: "Screenshots.live Render"
+description: "Generate app store screenshots via the Screenshots.live API. Design once, render for every device and language."
+author: "Screenshots.live"
+
+branding:
+  icon: "camera"
+  color: "green"
+
+inputs:
+  api-key:
+    description: "Your Screenshots.live API key"
+    required: true
+  yaml-config:
+    description: "Path to the YAML render configuration file"
+    required: true
+  output-directory:
+    description: "Directory to save rendered screenshots"
+    required: false
+    default: "./screenshots"
+  api-url:
+    description: "Override API base URL (for testing)"
+    required: false
+    default: "https://api.screenshots.live"
+  poll-interval:
+    description: "Seconds between job status checks"
+    required: false
+    default: "3"
+  timeout:
+    description: "Maximum seconds to wait for render completion"
+    required: false
+    default: "600"
+
+outputs:
+  output-path:
+    description: "Path to the directory containing rendered screenshots"
+  job-id:
+    description: "The render job ID"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Render screenshots
+      shell: bash
+      env:
+        API_KEY: ${{ inputs.api-key }}
+        YAML_CONFIG: ${{ inputs.yaml-config }}
+        OUTPUT_DIR: ${{ inputs.output-directory }}
+        API_URL: ${{ inputs.api-url }}
+        POLL_INTERVAL: ${{ inputs.poll-interval }}
+        TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        set -euo pipefail
+
+        if [ ! -f "$YAML_CONFIG" ]; then
+          echo "::error::YAML config file not found: $YAML_CONFIG"
+          exit 1
+        fi
+
+        YAML_CONTENT=$(cat "$YAML_CONFIG")
+
+        echo "Dispatching render job..."
+        RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+          "${API_URL}/render-api" \
+          -H "Authorization: Bearer ${API_KEY}" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -n --arg yaml "$YAML_CONTENT" '{yamlConfig: $yaml}')")
+
+        HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+        BODY=$(echo "$RESPONSE" | sed '$d')
+
+        if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+          echo "::error::API returned $HTTP_CODE: $BODY"
+          exit 1
+        fi
+
+        JOB_ID=$(echo "$BODY" | jq -r '.data.id // .id')
+        echo "Render job dispatched: $JOB_ID"
+        echo "job-id=$JOB_ID" >> "$GITHUB_OUTPUT"
+
+        echo "Polling for completion (timeout: ${TIMEOUT}s)..."
+        ELAPSED=0
+        while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+          STATUS_RESPONSE=$(curl -s \
+            "${API_URL}/render-jobs/${JOB_ID}" \
+            -H "Authorization: Bearer ${API_KEY}")
+
+          STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.data.status // .status')
+
+          case "$STATUS" in
+            Completed)
+              echo "Render completed!"
+              DOWNLOAD_URL=$(echo "$STATUS_RESPONSE" | jq -r '.data.downloadUrl // .downloadUrl')
+              break
+              ;;
+            Failed)
+              ERROR=$(echo "$STATUS_RESPONSE" | jq -r '.data.error // "Unknown error"')
+              echo "::error::Render failed: $ERROR"
+              exit 1
+              ;;
+            *)
+              sleep "$POLL_INTERVAL"
+              ELAPSED=$((ELAPSED + POLL_INTERVAL))
+              ;;
+          esac
+        done
+
+        if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
+          echo "::error::Render timed out after ${TIMEOUT}s"
+          exit 1
+        fi
+
+        echo "Downloading screenshots..."
+        mkdir -p "$OUTPUT_DIR"
+        ZIP_PATH="${OUTPUT_DIR}/screenshots.zip"
+        curl -s -o "$ZIP_PATH" "$DOWNLOAD_URL"
+
+        echo "Extracting..."
+        unzip -o -q "$ZIP_PATH" -d "$OUTPUT_DIR"
+        rm -f "$ZIP_PATH"
+
+        echo "output-path=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
+        echo "Screenshots saved to $OUTPUT_DIR"
+
+        FILE_COUNT=$(find "$OUTPUT_DIR" -type f | wc -l | tr -d ' ')
+        echo "::notice::Rendered $FILE_COUNT screenshot files"
