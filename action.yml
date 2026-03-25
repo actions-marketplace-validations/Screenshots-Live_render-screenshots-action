@@ -33,13 +33,16 @@ inputs:
 outputs:
   output-path:
     description: "Path to the directory containing rendered screenshots"
+    value: ${{ steps.render.outputs.output-path }}
   job-id:
     description: "The render job ID"
+    value: ${{ steps.render.outputs.job-id }}
 
 runs:
   using: "composite"
   steps:
-    - name: Render screenshots
+    - id: render
+      name: Render screenshots
       shell: bash
       env:
         API_KEY: ${{ inputs.api-key }}
@@ -56,14 +59,12 @@ runs:
           exit 1
         fi
 
-        YAML_CONTENT=$(cat "$YAML_CONFIG")
-
         echo "Dispatching render job..."
         RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
-          "${API_URL}/render-api" \
+          "${API_URL}/render/api" \
           -H "Authorization: Bearer ${API_KEY}" \
-          -H "Content-Type: application/json" \
-          -d "$(jq -n --arg yaml "$YAML_CONTENT" '{yamlConfig: $yaml}')")
+          -H "Content-Type: text/yaml" \
+          --data-binary @"${YAML_CONFIG}")
 
         HTTP_CODE=$(echo "$RESPONSE" | tail -1)
         BODY=$(echo "$RESPONSE" | sed '$d')
@@ -73,7 +74,7 @@ runs:
           exit 1
         fi
 
-        JOB_ID=$(echo "$BODY" | jq -r '.data.id // .id')
+        JOB_ID=$(echo "$BODY" | jq -r '.data.jobId // .data.id')
         echo "Render job dispatched: $JOB_ID"
         echo "job-id=$JOB_ID" >> "$GITHUB_OUTPUT"
 
@@ -81,7 +82,7 @@ runs:
         ELAPSED=0
         while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
           STATUS_RESPONSE=$(curl -s \
-            "${API_URL}/render-jobs/${JOB_ID}" \
+            "${API_URL}/render/get-render/${JOB_ID}" \
             -H "Authorization: Bearer ${API_KEY}")
 
           STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.data.status // .status')
